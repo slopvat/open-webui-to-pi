@@ -2,14 +2,14 @@
 
 # AI Disclosure:
 # - Authorship: AI-generated
-# - Models: frob/deepseek-v4-flash-0731:284b-a13b-ud-q8_k_xl,
-#     claude-opus-5-5 (Anthropic)
-# - Scope: Generated from a specification and iterative feedback in an
-#   agentic session. The first model reverse-engineered the Pi session JSONL
-#   schema, converted Open WebUI chat exports (and later live server chats)
-#   into that format, preserved conversation trees and synthesized
-#   model_change nodes. The second model reviewed the script against Pi's and
-#   Open WebUI's sources, fixing bugs and removing dead code.
+# - Models: claude-opus-5-5 (Anthropic),
+#     frob/deepseek-v4-flash-0731:284b-a13b-ud-q8_k_xl
+# - Scope: Generated from a specification and iterative feedback in agentic
+#   sessions. The deepseek model designed the conversion: the Pi session
+#   schema, tree ordering, synthesized model_change nodes and server
+#   fetching. claude-opus-5-5 reviewed it against Pi's and Open WebUI's
+#   sources, rewrote most of the code to fix bugs and remove dead code, and
+#   added clock-skew correction after the user questioned the timestamps.
 # - References:
 #   - https://github.com/earendil-works/pi (73f8de8)
 #   - https://github.com/open-webui/open-webui (91ea4e3)
@@ -39,10 +39,12 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 PROVIDER = "open-webui-import"
 API = "openai-completions"
+# Smallest browser/server clock disagreement worth correcting.
+CLOCK_SKEW_MIN_MS = 60_000
 
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -177,12 +179,22 @@ class OWUIConverter:
                          if isinstance(m, dict)}
         self.initial_model = _first(chat.get("models"))
 
-        # Every message's own timestamp, falling back to the chat's.
+        # Every message's own timestamp, corrected for clock skew, falling
+        # back to the chat's.
         chat_ms = (_to_ms(chat.get("timestamp"))
                    or _to_ms(chat.get("created_at"))
                    or int(datetime.now(timezone.utc).timestamp() * 1000))
-        self.ms = {mid: _to_ms(m.get("timestamp")) or chat_ms
-                   for mid, m in self.messages.items()}
+        own = {mid: _to_ms(m.get("timestamp"))
+               for mid, m in self.messages.items()}
+        self.clock_skew = self._clock_skew(own)
+        self.ms = {}
+        for mid, m in self.messages.items():
+            ms = own[mid]
+            if ms is None:
+                ms = chat_ms
+            elif self.clock_skew and m.get("role") == "assistant":
+                ms -= self.clock_skew
+            self.ms[mid] = ms
         self.created_ms = min(self.ms.values(), default=chat_ms)
 
         active = set()
@@ -208,6 +220,41 @@ class OWUIConverter:
 
         self._used_ids = set()
         self.id_map = {mid: self._new_id(mid) for mid in self.messages}
+
+    def _clock_skew(self, own):
+        """Milliseconds by which assistant timestamps run ahead of user ones.
+
+        Open WebUI stamps user messages with the browser's clock but creates
+        assistant messages server-side with the server's, so a wrong clock
+        on either side puts replies before their prompts or follow-ups
+        before the replies they answer. Every prompt -> reply edge bounds
+        the skew from above and every reply -> follow-up edge from below.
+        The server creates the reply the moment the prompt arrives, so the
+        upper bound is the estimate. Returns 0 unless the timestamps are out
+        of order by more than CLOCK_SKEW_MIN_MS, or None if no single offset
+        explains them (e.g. the clock was fixed partway through the chat)."""
+        upper = lower = None
+        for mid, m in self.messages.items():
+            pid = m.get("parentId")
+            if own[mid] is None or own.get(pid) is None:
+                continue
+            is_reply = m.get("role") == "assistant"
+            if is_reply == (self.messages[pid].get("role") == "assistant"):
+                continue
+            if is_reply:
+                gap = own[mid] - own[pid]
+                upper = gap if upper is None else min(upper, gap)
+            else:
+                gap = own[pid] - own[mid]
+                lower = gap if lower is None else max(lower, gap)
+        if (lower or 0) <= CLOCK_SKEW_MIN_MS and \
+                (upper or 0) >= -CLOCK_SKEW_MIN_MS:
+            return 0
+        if upper is None:
+            return lower
+        if lower is not None and lower > upper:
+            return None
+        return upper
 
     def _new_id(self, seed):
         """Stable Pi entry id: 8 hex chars, lengthened only on collision."""
@@ -366,8 +413,8 @@ class OWUIConverter:
         return ""
 
     def render(self, out_dir):
-        """Write the session .jsonl. Returns (path, message_count), or None if
-        the chat has no messages."""
+        """Write the session .jsonl. Returns (path, message_count,
+        clock_skew), or None if the chat has no messages."""
         if not self.messages:
             return None
         session_id = _session_id(self.chat)
@@ -382,7 +429,7 @@ class OWUIConverter:
             fh.write(json.dumps(self.header(session_id)) + "\n")
             for e in entries:
                 fh.write(json.dumps(e) + "\n")
-        return path, len(self.messages)
+        return path, len(self.messages), self.clock_skew
 
 
 def main():
@@ -485,8 +532,16 @@ def _convert_files(paths, out_dir, cwd):
 
 
 def _report(results):
-    for path, count in sorted(results):
-        print(f"wrote {path} ({count} messages)")
+    for path, count, skew in sorted(results, key=lambda r: r[0]):
+        if skew is None:
+            note = "; timestamps out of order, left as is"
+        elif skew:
+            shift = timedelta(seconds=round(abs(skew) / 1000))
+            note = (f"; assistant timestamps shifted {'-+'[skew < 0]}{shift}"
+                    " to undo clock skew")
+        else:
+            note = ""
+        print(f"wrote {path} ({count} messages{note})")
     return 0 if results else 1
 
 

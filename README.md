@@ -57,6 +57,13 @@ python3 owui_to_pi.py --server http://example.com -t "$TOKEN" ae769e1a
 - **Model metadata** — Each assistant message records its model, and synthetic
   `model_change` nodes mark where a different model started producing replies
   on each branch.
+- **Timestamps** — Open WebUI stamps your messages with the browser's clock
+  but its replies with the server's. If one clock is wrong, replies land
+  before their prompts or follow-ups before the replies they answer. When a
+  chat's timestamps prove the clocks disagreed by more than a minute, the
+  replies are shifted back in line with the prompts and the `wrote` line says
+  by how much. If no single offset fits (e.g. the clock was fixed partway
+  through a chat), the timestamps are left as they are and flagged.
 
 Anything Open WebUI exposes that has no equivalent in Pi (favorites, usage
 breakdowns beyond token counts, image attachments, tool calls and their
